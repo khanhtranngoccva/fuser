@@ -488,7 +488,7 @@ impl ReplyCreate {
             &attr.into(),
             ll::Generation(generation),
             ll::FileHandle(fh),
-            flags | FopenFlags::FOPEN_PASSTHROUGH,
+            FopenFlags::from_bits_retain(flags) | FopenFlags::FOPEN_PASSTHROUGH,
             backing_id.backing_id,
         ));
     }
