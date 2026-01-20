@@ -5,29 +5,55 @@
 //! filesystem is mounted, the session loop receives, dispatches and replies to kernel requests
 //! for filesystem operations under its mount point.
 
-use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
-use log::{info, warn};
-use nix::unistd::geteuid;
-use std::fmt;
+use std::borrow::Cow;
+use std::fs::File;
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::os::fd::AsFd;
+use std::os::fd::BorrowedFd;
+use std::os::fd::OwnedFd;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread::JoinHandle;
+use std::thread::{self};
+
+use libc::EAGAIN;
+use libc::EINTR;
+use libc::ENODEV;
+use libc::ENOENT;
+use log::debug;
+use log::error;
+use log::info;
+use log::warn;
+use nix::unistd::Uid;
+use nix::unistd::geteuid;
 
 use crate::Filesystem;
+use crate::KernelConfig;
 use crate::MountOption;
+use crate::Request;
 use crate::UnmountOption;
+use crate::channel::Channel;
+use crate::channel::ChannelSender;
+use crate::dev_fuse::DevFuse;
+use crate::ll;
+use crate::ll::Request as _;
+use crate::ll::Response;
+use crate::ll::Version;
 use crate::ll::fuse_abi as abi;
+use crate::mnt::Mount;
 use crate::mnt::unmount_options;
-use crate::request::Request;
-use crate::{channel::Channel, mnt::Mount};
-use crate::{channel::ChannelSender, notify::Notifier};
+use crate::notify::Notifier;
+use crate::reply::Reply;
+use crate::reply::ReplyRaw;
+use crate::reply::ReplySender;
+use crate::request::RequestWithSender;
 
 /// The max size of write requests from the kernel. The absolute minimum is 4k,
 /// FUSE recommends at least 128k, max 16M. The FUSE default is 16M on macOS
 /// and 128k on other systems.
-pub const MAX_WRITE_SIZE: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_WRITE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Size of the buffer for reading a request from the kernel. Since the kernel may send
 /// up to `MAX_WRITE_SIZE` bytes in a write request, we use that value plus some extra space.
@@ -58,13 +84,10 @@ pub struct Session<FS: Filesystem> {
     /// Used to implement `allow_root` and `auto_unmount`
     pub(crate) allowed: SessionACL,
     /// User that launched the fuser process
-    pub(crate) session_owner: u32,
-    /// FUSE protocol major version
-    pub(crate) proto_major: u32,
-    /// FUSE protocol minor version
-    pub(crate) proto_minor: u32,
-    /// True if the filesystem is initialized (init operation done)
-    pub(crate) initialized: bool,
+    pub(crate) session_owner: Uid,
+    /// FUSE protocol version, as reported by the kernel.
+    /// The field is set to `Some` when the init message is received.
+    pub(crate) proto_version: Option<Version>,
     /// True if the filesystem was destroyed (destroy operation done)
     pub(crate) destroyed: bool,
 }
@@ -117,10 +140,8 @@ impl<FS: Filesystem> Session<FS> {
             ch,
             mount: Arc::new(Mutex::new(Some((mountpoint.to_owned(), mount)))),
             allowed,
-            session_owner: geteuid().as_raw(),
-            proto_major: 0,
-            proto_minor: 0,
-            initialized: false,
+            session_owner: geteuid(),
+            proto_version: None,
             destroyed: false,
         })
     }
@@ -128,16 +149,14 @@ impl<FS: Filesystem> Session<FS> {
     /// Wrap an existing /dev/fuse file descriptor. This doesn't mount the
     /// filesystem anywhere; that must be done separately.
     pub fn from_fd(filesystem: FS, fd: OwnedFd, acl: SessionACL) -> Self {
-        let ch = Channel::new(Arc::new(fd.into()));
+        let ch = Channel::new(Arc::new(DevFuse(File::from(fd))));
         Session {
             filesystem,
             ch,
             mount: Arc::new(Mutex::new(None)),
             allowed: acl,
-            session_owner: geteuid().as_raw(),
-            proto_major: 0,
-            proto_minor: 0,
-            initialized: false,
+            session_owner: geteuid(),
+            proto_version: None,
             destroyed: false,
         }
     }
@@ -152,12 +171,15 @@ impl<FS: Filesystem> Session<FS> {
         // Buffer for receiving requests from the kernel. Only one is allocated and
         // it is reused immediately after dispatching to conserve memory and allocations.
         let mut buffer = vec![0; BUFFER_SIZE];
-        let buf = aligned_sub_buf(&mut buffer, std::mem::align_of::<abi::fuse_in_header>());
+        let buf = aligned_sub_buf(&mut buffer, align_of::<abi::fuse_in_header>());
+
+        self.handshake(buf)?;
+
         loop {
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
             match self.ch.receive(buf) {
-                Ok(size) => match Request::new(self.ch.sender(), &buf[..size]) {
+                Ok(size) => match RequestWithSender::new(self.ch.sender(), &buf[..size]) {
                     // Dispatch request
                     Some(req) => req.dispatch(self),
                     // Quit loop on illegal request
@@ -178,7 +200,7 @@ impl<FS: Filesystem> Session<FS> {
         Ok(())
     }
 
-    /// Set the unmount options
+    /// Set the unmount options on drop
     pub fn set_unmount_options(&mut self, options: Option<&[UnmountOption]>) -> io::Result<()> {
         if let Some(options) = options {
             unmount_options::check_option_conflicts(options)?;
@@ -198,9 +220,160 @@ impl<FS: Filesystem> Session<FS> {
         });
     }
 
+    fn handshake(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        loop {
+            // Read the init request from the kernel
+            let size = match self.ch.receive(buf) {
+                Ok(size) => size,
+                Err(err) => match err.raw_os_error() {
+                    Some(ENOENT | EINTR | EAGAIN) => continue,
+                    Some(ENODEV) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "FUSE device disconnected during handshake",
+                        ));
+                    }
+                    _ => return Err(err),
+                },
+            };
+
+            // Parse the request
+            let request = match ll::AnyRequest::try_from(&buf[..size]) {
+                Ok(request) => request,
+                Err(err) => {
+                    error!("{err}");
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, err.to_string()));
+                }
+            };
+
+            // Extract the init operation
+            let op = match request.operation() {
+                Ok(op) => op,
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Failed to parse FUSE operation",
+                    ));
+                }
+            };
+
+            let init = match op {
+                ll::Operation::Init(init) => init,
+                _ => {
+                    error!("Received non-init FUSE operation before init: {}", request);
+                    // Send error response and return error - non-init during handshake is invalid
+                    let response = Response::new_error(ll::Errno::EIO);
+                    <ReplyRaw as Reply>::new(
+                        request.unique(),
+                        ReplySender::Channel(self.ch.sender()),
+                    )
+                    .send_ll(&response);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Received non-init FUSE operation during handshake",
+                    ));
+                }
+            };
+
+            let v = init.version();
+            if v.0 > abi::FUSE_KERNEL_VERSION {
+                // Kernel has a newer major version than we support.
+                // Send our version and wait for a second INIT request with a compatible version.
+                debug!(
+                    "INIT: Kernel version {} > our version {}, sending our version and waiting for next init",
+                    v.0,
+                    abi::FUSE_KERNEL_VERSION
+                );
+                let response = init.reply_version_only();
+                <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
+                    .send_ll(&response);
+                continue;
+            }
+
+            // We don't support ABI versions before 7.6
+            if v < Version(7, 6) {
+                error!("Unsupported FUSE ABI version {v}");
+                let response = Response::new_error(ll::Errno::EPROTO);
+                <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
+                    .send_ll(&response);
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("Unsupported FUSE ABI version {v}"),
+                ));
+            }
+
+            let mut config = KernelConfig::new(init.capabilities(), init.max_readahead(), v);
+
+            // Call filesystem init method and give it a chance to return an error
+            if let Err(errno) = self
+                .filesystem
+                .init(Request::ref_cast(request.header()), &mut config)
+            {
+                let response = Response::new_error(errno);
+                <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
+                    .send_ll(&response);
+                return Err(io::Error::from_raw_os_error(errno.0.get()));
+            }
+
+            // Remember the ABI version supported by kernel and mark the session initialized.
+            self.proto_version = Some(v);
+
+            // Log capability status for debugging
+            for bit in 0..64 {
+                let bitflags = abi::InitFlags::from_bits_retain(1 << bit);
+                if bitflags == abi::InitFlags::FUSE_INIT_EXT {
+                    continue;
+                }
+                let bitflag_is_known = abi::InitFlags::all().contains(bitflags);
+                let kernel_supports = init.capabilities().contains(bitflags);
+                let we_requested = config.requested.contains(bitflags);
+                // On macOS, there's a clash between linux and macOS constants,
+                // so we pick macOS ones (last).
+                let name = if let Some((name, _)) = bitflags.iter_names().last() {
+                    Cow::Borrowed(name)
+                } else {
+                    Cow::Owned(format!("(1 << {bit})"))
+                };
+                if we_requested && kernel_supports {
+                    debug!("capability {name} enabled")
+                } else if we_requested {
+                    debug!("capability {name} not supported by kernel")
+                } else if kernel_supports {
+                    debug!("capability {name} not requested by client")
+                } else if bitflag_is_known {
+                    debug!("capability {name} not supported nor requested")
+                }
+            }
+
+            // Reply with our desired version and settings.
+            debug!(
+                "INIT response: ABI {}.{}, flags {:#x}, max readahead {}, max write {}",
+                abi::FUSE_KERNEL_VERSION,
+                abi::FUSE_KERNEL_MINOR_VERSION,
+                init.capabilities() & config.requested,
+                config.max_readahead,
+                config.max_write
+            );
+
+            let response = init.reply(&config);
+            <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
+                .send_ll(&response);
+
+            return Ok(());
+        }
+    }
+
     /// Unmount the filesystem
-    pub fn unmount(&mut self) {
-        drop(std::mem::take(&mut *self.mount.lock().unwrap()));
+    pub fn unmount(&mut self) -> io::Result<()> {
+        let mut guard = self.mount.lock().unwrap();
+        let mount_info = guard.take();
+        if let Some((path, mount)) = mount_info {
+            if let Err((mount, e)) = mount.unmount() {
+                *guard = Some((path, mount));
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     /// Returns a thread-safe object that can be used to unmount the Filesystem
@@ -289,6 +462,7 @@ impl<FS: Filesystem> Drop for Session<FS> {
 }
 
 /// The background session data structure
+#[derive(Debug)]
 pub struct BackgroundSession {
     /// Thread guard of the background session
     pub guard: JoinHandle<io::Result<()>>,
@@ -316,6 +490,7 @@ impl BackgroundSession {
             _mount: mount,
         })
     }
+
     /// Unmount the filesystem and join the background thread.
     ///
     /// # Returns
@@ -325,7 +500,7 @@ impl BackgroundSession {
     ///
     /// # Panics
     /// Panics if the background thread can't be recovered (e.g., because it panicked).
-    pub fn join(mut self) -> Result<(), (Option<Self>, io::Error)> {
+    pub fn unmount_and_join(mut self) -> Result<(), (Option<Self>, io::Error)> {
         if let Some(mount) = self._mount.take() {
             if let Err((mount, e)) = mount.unmount() {
                 // Return the mount and error to the object and to retry unmounting at another time
@@ -333,7 +508,18 @@ impl BackgroundSession {
                 return Err((Some(self), e));
             }
         }
-        self.guard.join().unwrap().map_err(|e| (None, e))?;
+        self.guard
+            .join()
+            .map_err(|_panic: Box<dyn std::any::Any + Send>| {
+                (
+                    None,
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        "filesystem background thread panicked",
+                    ),
+                )
+            })?
+            .map_err(|e| (None, e))?;
         Ok(())
     }
 
@@ -354,13 +540,5 @@ impl BackgroundSession {
     /// Enable or disable blocking if the umount operation is busy
     pub fn set_blocking_unmount(&mut self, blocking: bool) {
         self._mount.as_mut().unwrap().set_blocking_unmount(blocking);
-    }
-}
-
-// replace with #[derive(Debug)] if Debug ever gets implemented for
-// thread_scoped::JoinGuard
-impl fmt::Debug for BackgroundSession {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        write!(f, "BackgroundSession {{ guard: JoinGuard<()> }}",)
     }
 }

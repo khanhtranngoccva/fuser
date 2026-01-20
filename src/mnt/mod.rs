@@ -13,25 +13,27 @@ mod fuse3_sys;
 
 #[cfg(fuser_mount_impl = "pure-rust")]
 mod fuse_pure;
-pub mod mount_options;
-pub mod unmount_options;
 
-#[cfg(any(test, fuser_mount_impl = "libfuse2", fuser_mount_impl = "libfuse3"))]
-use fuse2_sys::fuse_args;
-#[cfg(any(test, fuser_mount_impl = "pure-rust"))]
-use std::fs::File;
+pub(crate) mod mount_options;
+pub(crate) mod unmount_options;
+
 use std::io;
 
 #[cfg(any(test, fuser_mount_impl = "libfuse2", fuser_mount_impl = "libfuse3"))]
+use fuse2_sys::fuse_args;
+#[cfg(any(test, fuser_mount_impl = "libfuse2", fuser_mount_impl = "libfuse3"))]
 use mount_options::MountOption;
-use unmount_options::UnmountOption;
+
+#[cfg(any(test, fuser_mount_impl = "pure-rust"))]
+use crate::dev_fuse::DevFuse;
 
 /// Helper function to provide options as a `fuse_args` struct
 /// (which contains an argc count and an argv pointer)
 #[cfg(any(test, fuser_mount_impl = "libfuse2", fuser_mount_impl = "libfuse3"))]
 fn with_fuse_args<T, F: FnOnce(&fuse_args) -> T>(options: &[MountOption], f: F) -> T {
-    use mount_options::option_to_string;
     use std::ffi::CString;
+
+    use mount_options::option_to_string;
 
     let mut args = vec![CString::new("rust-fuse").unwrap()];
     for x in options {
@@ -48,13 +50,14 @@ fn with_fuse_args<T, F: FnOnce(&fuse_args) -> T>(options: &[MountOption], f: F) 
     })
 }
 
-#[cfg(fuser_mount_impl = "pure-rust")]
-pub use fuse_pure::Mount;
-#[cfg(fuser_mount_impl = "libfuse2")]
-pub use fuse2::Mount;
-#[cfg(fuser_mount_impl = "libfuse3")]
-pub use fuse3::Mount;
 use std::ffi::CStr;
+
+#[cfg(fuser_mount_impl = "pure-rust")]
+pub(crate) use fuse_pure::Mount;
+#[cfg(fuser_mount_impl = "libfuse2")]
+pub(crate) use fuse2::Mount;
+#[cfg(fuser_mount_impl = "libfuse3")]
+pub(crate) use fuse3::Mount;
 
 #[inline]
 fn libc_umount(mnt: &CStr) -> io::Result<()> {
@@ -65,7 +68,10 @@ fn libc_umount(mnt: &CStr) -> io::Result<()> {
         target_os = "openbsd",
         target_os = "netbsd"
     ))]
-    let r = unsafe { libc::unmount(mnt.as_ptr(), 0) };
+    {
+        nix::mount::unmount(mnt, nix::mount::MntFlags::empty())?;
+        Ok(())
+    }
 
     #[cfg(not(any(
         target_os = "macos",
@@ -74,10 +80,8 @@ fn libc_umount(mnt: &CStr) -> io::Result<()> {
         target_os = "openbsd",
         target_os = "netbsd"
     )))]
-    let r = unsafe { libc::umount(mnt.as_ptr()) };
-    if r < 0 {
-        Err(io::Error::last_os_error())
-    } else {
+    {
+        nix::mount::umount(mnt)?;
         Ok(())
     }
 }
@@ -85,39 +89,41 @@ fn libc_umount(mnt: &CStr) -> io::Result<()> {
 /// Warning: This will return true if the filesystem has been detached (lazy unmounted), but not
 /// yet destroyed by the kernel.
 #[cfg(any(test, fuser_mount_impl = "pure-rust"))]
-fn is_mounted(fuse_device: &File) -> bool {
-    use libc::{poll, pollfd};
-    use std::os::unix::prelude::AsRawFd;
+fn is_mounted(fuse_device: &DevFuse) -> bool {
+    use std::os::unix::io::AsFd;
+    use std::slice;
 
-    let mut poll_result = pollfd {
-        fd: fuse_device.as_raw_fd(),
-        events: 0,
-        revents: 0,
-    };
+    use nix::poll::PollFd;
+    use nix::poll::PollFlags;
+    use nix::poll::PollTimeout;
+    use nix::poll::poll;
+
     loop {
-        let res = unsafe { poll(&mut poll_result, 1, 0) };
+        let mut poll_fd = PollFd::new(fuse_device.as_fd(), PollFlags::empty());
+        let res = poll(slice::from_mut(&mut poll_fd), PollTimeout::ZERO);
         break match res {
-            0 => true,
-            1 => (poll_result.revents & libc::POLLERR) != 0,
-            -1 => {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
+            Ok(0) => true,
+            Ok(1) => poll_fd
+                .revents()
+                .is_some_and(|r| r.contains(PollFlags::POLLERR)),
+            Ok(_) => unreachable!(),
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(err) => {
                 // This should never happen. The fd is guaranteed good as `File` owns it.
                 // According to man poll ENOMEM is the only error code unhandled, so we panic
                 // consistent with rust's usual ENOMEM behaviour.
                 panic!("Poll failed with error {err}")
             }
-            _ => unreachable!(),
         };
     }
 }
 
 #[cfg(test)]
 mod test {
+    use std::ffi::CStr;
+    use std::mem::ManuallyDrop;
+
     use super::*;
-    use std::{ffi::CStr, mem::ManuallyDrop};
 
     #[test]
     fn fuse_args() {

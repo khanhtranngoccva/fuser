@@ -10,16 +10,17 @@ use fuser::Errno;
 use fuser::FileAttr;
 use fuser::FileHandle;
 use fuser::FileType;
-use fuser::Filesystem;
 use fuser::INodeNo;
 use fuser::LockOwner;
 use fuser::MountOption;
 use fuser::ReadFlags;
-use fuser::ReplyAttr;
-use fuser::ReplyData;
-use fuser::ReplyDirectory;
-use fuser::ReplyEntry;
-use fuser::Request;
+use fuser::experimental;
+use fuser::experimental::AsyncFilesystem;
+use fuser::experimental::DirEntListBuilder;
+use fuser::experimental::GetAttrResponse;
+use fuser::experimental::LookupResponse;
+use fuser::experimental::RequestContext;
+use fuser::experimental::TokioAdapter;
 
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
@@ -63,52 +64,67 @@ const HELLO_TXT_ATTR: FileAttr = FileAttr {
 
 struct HelloFS;
 
-impl Filesystem for HelloFS {
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        if u64::from(parent) == 1 && name.to_str() == Some("hello.txt") {
-            reply.entry(&TTL, &HELLO_TXT_ATTR, fuser::Generation(0));
-        } else {
-            reply.error(Errno::ENOENT);
-        }
-    }
-
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        match u64::from(ino) {
-            1 => reply.attr(&TTL, &HELLO_DIR_ATTR),
-            2 => reply.attr(&TTL, &HELLO_TXT_ATTR),
-            _ => reply.error(Errno::ENOENT),
-        }
-    }
-
-    fn read(
+#[async_trait::async_trait]
+impl AsyncFilesystem for HelloFS {
+    async fn lookup(
         &self,
-        _req: &Request,
+        _context: &RequestContext,
+        parent: INodeNo,
+        name: &OsStr,
+    ) -> experimental::Result<LookupResponse> {
+        if parent == INodeNo::ROOT && name.to_str() == Some("hello.txt") {
+            Ok(LookupResponse::new(
+                TTL,
+                HELLO_TXT_ATTR,
+                fuser::Generation(0),
+            ))
+        } else {
+            Err(Errno::ENOENT)
+        }
+    }
+
+    async fn getattr(
+        &self,
+        _context: &RequestContext,
         ino: INodeNo,
-        _fh: FileHandle,
+        _file_handle: Option<FileHandle>,
+    ) -> experimental::Result<GetAttrResponse> {
+        match ino.0 {
+            1 => Ok(GetAttrResponse::new(TTL, HELLO_DIR_ATTR)),
+            2 => Ok(GetAttrResponse::new(TTL, HELLO_TXT_ATTR)),
+            _ => Err(Errno::ENOENT),
+        }
+    }
+
+    async fn read(
+        &self,
+        _context: &RequestContext,
+        ino: INodeNo,
+        _file_handle: FileHandle,
         offset: u64,
         _size: u32,
         _flags: ReadFlags,
-        _lock_owner: Option<LockOwner>,
-        reply: ReplyData,
-    ) {
-        if u64::from(ino) == 2 {
-            reply.data(&HELLO_TXT_CONTENT.as_bytes()[offset as usize..]);
+        _lock: Option<LockOwner>,
+        out_data: &mut Vec<u8>,
+    ) -> experimental::Result<()> {
+        if ino.0 == 2 {
+            out_data.extend_from_slice(&HELLO_TXT_CONTENT.as_bytes()[offset as usize..]);
+            Ok(())
         } else {
-            reply.error(Errno::ENOENT);
+            Err(Errno::ENOENT)
         }
     }
 
-    fn readdir(
+    async fn readdir(
         &self,
-        _req: &Request,
+        _context: &RequestContext,
         ino: INodeNo,
-        _fh: FileHandle,
+        _file_handle: FileHandle,
         offset: u64,
-        mut reply: ReplyDirectory,
-    ) {
-        if u64::from(ino) != 1 {
-            reply.error(Errno::ENOENT);
-            return;
+        mut builder: DirEntListBuilder<'_>,
+    ) -> experimental::Result<()> {
+        if ino != INodeNo::ROOT {
+            return Err(Errno::ENOENT);
         }
 
         let entries = vec![
@@ -119,11 +135,11 @@ impl Filesystem for HelloFS {
 
         for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
             // i + 1 means the index of the next entry
-            if reply.add(INodeNo(entry.0), (i + 1) as u64, entry.1, entry.2) {
+            if builder.add(INodeNo(entry.0), (i + 1) as u64, entry.1, entry.2) {
                 break;
             }
         }
-        reply.ok();
+        Ok(())
     }
 }
 
@@ -159,5 +175,5 @@ fn main() {
     if matches.get_flag("allow-root") {
         options.push(MountOption::AllowRoot);
     }
-    fuser::mount2(HelloFS, mountpoint, &options).unwrap();
+    fuser::mount2(TokioAdapter::new(HelloFS), mountpoint, &options).unwrap();
 }

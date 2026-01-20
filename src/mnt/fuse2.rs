@@ -1,16 +1,17 @@
-use super::UnmountOption;
-use super::{MountOption, fuse2_sys::*, unmount_options, with_fuse_args};
+use std::ffi::CString;
+use std::fs::File;
+use std::io;
+use std::os::unix::prelude::FromRawFd;
+use std::os::unix::prelude::OsStrExt;
+use std::path::Path;
+use std::sync::Arc;
+
 use log::warn;
-use std::ffi::{CStr, c_int};
-use std::time::Duration;
-use std::{
-    ffi::CString,
-    fs::File,
-    io,
-    os::unix::prelude::{FromRawFd, OsStrExt},
-    path::Path,
-    sync::Arc,
-};
+
+use super::MountOption;
+use super::fuse2_sys::*;
+use super::with_fuse_args;
+use crate::dev_fuse::DevFuse;
 
 /// Ensures that an os error is never 0/Success
 fn ensure_last_os_error() -> io::Error {
@@ -22,7 +23,7 @@ fn ensure_last_os_error() -> io::Error {
 }
 
 #[derive(Debug)]
-pub struct Mount {
+pub(crate) struct Mount {
     mountpoint: CString,
     blocking_umount: bool,
     unmount_flags: Option<Vec<UnmountOption>>,
@@ -30,7 +31,10 @@ pub struct Mount {
 }
 
 impl Mount {
-    pub fn new(mountpoint: &Path, options: &[MountOption]) -> io::Result<(Arc<File>, Mount)> {
+    pub(crate) fn new(
+        mountpoint: &Path,
+        options: &[MountOption],
+    ) -> io::Result<(Arc<DevFuse>, Mount)> {
         let mountpoint = CString::new(mountpoint.as_os_str().as_bytes()).unwrap();
         with_fuse_args(options, |args| {
             let fd = unsafe { fuse_mount_compat25(mountpoint.as_ptr(), args) };
@@ -39,7 +43,7 @@ impl Mount {
             } else {
                 let file = unsafe { File::from_raw_fd(fd) };
                 Ok((
-                    Arc::new(file),
+                    Arc::new(DevFuse(file)),
                     Mount {
                         mountpoint,
                         blocking_umount: false,

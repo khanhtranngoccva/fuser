@@ -1,15 +1,32 @@
 //! Low-level kernel communication.
 
 mod argument;
-pub mod fuse_abi;
+pub(crate) mod copy_file_range_flags;
+pub(crate) mod cuse_init_flags;
+pub(crate) mod fsync_flags;
+pub(crate) mod fuse_abi;
+pub(crate) mod ioctl_flags;
 pub(crate) mod notify;
+pub(crate) mod poll_flags;
+pub(crate) mod read_flags;
+pub(crate) mod release_flags;
 pub(crate) mod reply;
 pub(crate) mod request;
+pub(crate) mod write_flags;
 
-use std::{convert::TryInto, num::NonZeroI32, time::SystemTime};
+use std::convert::TryInto;
+use std::num::NonZeroI32;
+use std::time::SystemTime;
 
-pub use reply::Response;
-pub use request::{AnyRequest, FileHandle, INodeNo, Lock, Operation, Request, RequestId, Version};
+pub(crate) use reply::Response;
+pub(crate) use request::AnyRequest;
+pub(crate) use request::FileHandle;
+pub(crate) use request::INodeNo;
+pub(crate) use request::Lock;
+pub(crate) use request::Operation;
+pub(crate) use request::Request;
+pub use request::RequestId;
+pub(crate) use request::Version;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 /// Possible input arguments for atime & mtime, which can either be set to a specified time,
@@ -22,15 +39,10 @@ pub enum TimeOrNow {
 }
 
 macro_rules! errno {
-    ($x: expr_2021) => {
-        Errno(unsafe {
-            // This is a static assertion that the constant $x is > 0
-            const _X: [(); 0 - !{
-                const ASSERT: bool = ($x > 0);
-                ASSERT
-            } as usize] = [];
-            // Which makes this safe
-            NonZeroI32::new_unchecked($x)
+    ($x:expr) => {
+        Errno(match NonZeroI32::new($x) {
+            Some(x) => x,
+            None => panic!(),
         })
     };
 }
@@ -40,7 +52,7 @@ macro_rules! no_xattr_doc {
 }
 
 /// Represents an error code to be returned to the caller
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct Errno(pub NonZeroI32);
 impl Errno {
     /// Operation not permitted
@@ -213,6 +225,9 @@ impl Errno {
     pub const ENOTRECOVERABLE: Errno = errno!(libc::ENOTRECOVERABLE);
     /// Operation not supported
     pub const ENOTSUP: Errno = errno!(libc::ENOTSUP);
+    /// Wrong file type.
+    #[cfg(any(target_os = "freebsd", target_os = "macos"))]
+    pub const EFTYPE: Errno = errno!(libc::EFTYPE);
 
     /// No data available
     #[cfg(target_os = "linux")]
@@ -228,6 +243,7 @@ impl Errno {
     #[cfg(not(target_os = "linux"))]
     pub const NO_XATTR: Errno = Self::ENOATTR;
 
+    /// Make errno from `i32`, defaulting to `EIO` if it is zero.
     pub fn from_i32(err: i32) -> Errno {
         err.try_into().ok().map_or(Errno::EIO, Errno)
     }
@@ -239,12 +255,6 @@ impl From<std::io::Error> for Errno {
             Ok(i) => Errno(i),
             Err(_) => Errno::EIO,
         }
-    }
-}
-impl From<nix::errno::Errno> for Errno {
-    fn from(x: nix::errno::Errno) -> Self {
-        let err: std::io::Error = x.into();
-        err.into()
     }
 }
 impl From<std::io::ErrorKind> for Errno {
@@ -277,7 +287,8 @@ impl From<Generation> for u64 {
 #[cfg(test)]
 mod test {
     use std::io::IoSlice;
-    use std::ops::{Deref, DerefMut};
+    use std::ops::Deref;
+    use std::ops::DerefMut;
     /// If we want to be able to cast bytes to our fuse C struct types we need it
     /// to be aligned.  This struct helps getting &[u8]s which are 8 byte aligned.
     #[cfg(test)]
@@ -296,7 +307,7 @@ mod test {
         }
     }
 
-    pub fn ioslice_to_vec(s: &[IoSlice<'_>]) -> Vec<u8> {
+    pub(crate) fn ioslice_to_vec(s: &[IoSlice<'_>]) -> Vec<u8> {
         let mut v = Vec::with_capacity(s.iter().map(|x| x.len()).sum());
         for x in s {
             v.extend_from_slice(x);

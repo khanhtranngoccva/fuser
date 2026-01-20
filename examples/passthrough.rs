@@ -2,17 +2,36 @@
 //
 //   cargo run --example passthrough --features abi-7-40 /tmp/foobar
 
-use clap::{Arg, ArgAction, Command, crate_version};
-use fuser::{
-    BackingId, FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, Request, consts,
-};
-use libc::ENOENT;
 use std::collections::HashMap;
-use std::ffi::{OsStr, c_int};
+use std::ffi::OsStr;
 use std::fs::File;
-use std::rc::{Rc, Weak};
-use std::time::{Duration, UNIX_EPOCH};
+use std::rc::Rc;
+use std::rc::Weak;
+use std::time::Duration;
+use std::time::UNIX_EPOCH;
+
+use clap::Arg;
+use clap::ArgAction;
+use clap::Command;
+use clap::crate_version;
+use fuser::BackingId;
+use fuser::Errno;
+use fuser::FileAttr;
+use fuser::FileHandle;
+use fuser::FileType;
+use fuser::Filesystem;
+use fuser::INodeNo;
+use fuser::InitFlags;
+use fuser::KernelConfig;
+use fuser::LockOwner;
+use fuser::MountOption;
+use fuser::OpenFlags;
+use fuser::ReplyAttr;
+use fuser::ReplyDirectory;
+use fuser::ReplyEmpty;
+use fuser::ReplyEntry;
+use fuser::ReplyOpen;
+use fuser::Request;
 
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
@@ -34,7 +53,7 @@ const TTL: Duration = Duration::from_secs(1); // 1 second
 #[derive(Debug, Default)]
 struct BackingCache {
     by_handle: HashMap<u64, Rc<BackingId>>,
-    by_inode: HashMap<u64, Weak<BackingId>>,
+    by_inode: HashMap<INodeNo, Weak<BackingId>>,
     next_fh: u64,
 }
 
@@ -50,7 +69,7 @@ impl BackingCache {
     /// returned file handle should be `put()` when you're done with it.
     fn get_or(
         &mut self,
-        ino: u64,
+        ino: INodeNo,
         callback: impl Fn() -> std::io::Result<BackingId>,
     ) -> std::io::Result<(u64, Rc<BackingId>)> {
         let fh = self.next_fh();
@@ -80,20 +99,22 @@ impl BackingCache {
     }
 }
 
+use std::sync::Mutex;
+
 #[derive(Debug)]
 struct PassthroughFs {
     root_attr: FileAttr,
     passthrough_file_attr: FileAttr,
-    backing_cache: BackingCache,
+    backing_cache: Mutex<BackingCache>,
 }
 
 impl PassthroughFs {
     fn new() -> Self {
-        let uid = unsafe { libc::getuid() };
-        let gid = unsafe { libc::getgid() };
+        let uid = nix::unistd::getuid().into();
+        let gid = nix::unistd::getgid().into();
 
         let root_attr = FileAttr {
-            ino: 1,
+            ino: INodeNo::ROOT,
             size: 0,
             blocks: 0,
             atime: UNIX_EPOCH, // 1970-01-01 00:00:00
@@ -111,7 +132,7 @@ impl PassthroughFs {
         };
 
         let passthrough_file_attr = FileAttr {
-            ino: 2,
+            ino: INodeNo(2),
             size: 123_456,
             blocks: 1,
             atime: UNIX_EPOCH, // 1970-01-01 00:00:00
@@ -131,46 +152,46 @@ impl PassthroughFs {
         Self {
             root_attr,
             passthrough_file_attr,
-            backing_cache: BackingCache::default(),
+            backing_cache: Mutex::new(BackingCache::default()),
         }
     }
 }
 
 impl Filesystem for PassthroughFs {
-    fn init(
-        &mut self,
-        _req: &Request,
-        config: &mut KernelConfig,
-    ) -> std::result::Result<(), c_int> {
-        config.add_capabilities(consts::FUSE_PASSTHROUGH).unwrap();
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> Result<(), Errno> {
+        config
+            .add_capabilities(InitFlags::FUSE_PASSTHROUGH)
+            .unwrap();
         config.set_max_stack_depth(2).unwrap();
         Ok(())
     }
 
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        if parent == 1 && name.to_str() == Some("passthrough") {
-            reply.entry(&TTL, &self.passthrough_file_attr, 0);
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        if parent == INodeNo::ROOT && name.to_str() == Some("passthrough") {
+            reply.entry(&TTL, &self.passthrough_file_attr, fuser::Generation(0));
         } else {
-            reply.error(ENOENT);
+            reply.error(Errno::ENOENT);
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        match ino {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        match ino.0 {
             1 => reply.attr(&TTL, &self.root_attr),
             2 => reply.attr(&TTL, &self.passthrough_file_attr),
-            _ => reply.error(ENOENT),
+            _ => reply.error(Errno::ENOENT),
         }
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
-        if ino != 2 {
-            reply.error(ENOENT);
+    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        if ino != INodeNo(2) {
+            reply.error(Errno::ENOENT);
             return;
         }
 
         let (fh, id) = self
             .backing_cache
+            .lock()
+            .unwrap()
             .get_or(ino, || {
                 let file = File::open("/etc/profile")?;
                 reply.open_backing(file)
@@ -178,33 +199,33 @@ impl Filesystem for PassthroughFs {
             .unwrap();
 
         eprintln!("  -> opened_passthrough({fh:?}, 0, {id:?});\n");
-        reply.opened_passthrough(fh, 0, &id);
+        reply.opened_passthrough(FileHandle(fh), 0, &id);
     }
 
     fn release(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
         _flags: i32,
-        _lock_owner: Option<u64>,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.backing_cache.put(fh);
+        self.backing_cache.lock().unwrap().put(_fh.into());
         reply.ok();
     }
 
     fn readdir(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        if ino != 1 {
-            reply.error(ENOENT);
+        if ino != INodeNo::ROOT {
+            reply.error(Errno::ENOENT);
             return;
         }
 
@@ -216,7 +237,7 @@ impl Filesystem for PassthroughFs {
 
         for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
             // i + 1 means the index of the next entry
-            if reply.add(entry.0, (i + 1) as i64, entry.1, entry.2) {
+            if reply.add(INodeNo(entry.0), (i + 1) as u64, entry.1, entry.2) {
                 break;
             }
         }
