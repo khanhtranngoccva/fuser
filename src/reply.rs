@@ -335,9 +335,9 @@ impl ReplyOpen {
 
     /// Reply to a request with an opened backing id. Call [`ReplyOpen::open_backing()`]
     /// to get one of these.
-    pub fn opened_passthrough(self, fh: ll::FileHandle, flags: u32, backing_id: &BackingId) {
+    pub fn opened_passthrough(self, fh: ll::FileHandle, flags: FopenFlags, backing_id: &BackingId) {
         // TODO: assert passthrough capability is enabled.
-        let flags = FopenFlags::from_bits_retain(flags) | FopenFlags::FOPEN_PASSTHROUGH;
+        let flags = flags | FopenFlags::FOPEN_PASSTHROUGH;
         self.reply
             .send_ll(&ll::Response::new_open(fh, flags, backing_id.backing_id));
     }
@@ -443,9 +443,8 @@ impl ReplyCreate {
         attr: &FileAttr,
         generation: Generation,
         fh: ll::FileHandle,
-        flags: u32,
+        flags: FopenFlags,
     ) {
-        let flags = FopenFlags::from_bits_retain(flags);
         assert!(!flags.contains(FopenFlags::FOPEN_PASSTHROUGH));
         self.reply.send_ll(&ll::Response::new_create(
             ttl,
@@ -478,7 +477,7 @@ impl ReplyCreate {
         attr: &FileAttr,
         generation: Generation,
         fh: ll::FileHandle,
-        flags: u32,
+        flags: FopenFlags,
         backing_id: &BackingId,
     ) {
         self.reply.send_ll(&ll::Response::new_create(
@@ -486,7 +485,7 @@ impl ReplyCreate {
             &attr.into(),
             generation,
             fh,
-            FopenFlags::from_bits_retain(flags) | FopenFlags::FOPEN_PASSTHROUGH,
+            flags | FopenFlags::FOPEN_PASSTHROUGH,
             backing_id.backing_id,
         ));
     }
@@ -1104,7 +1103,7 @@ mod test {
             &attr,
             ll::Generation(0xaa),
             ll::FileHandle(0xbb),
-            0x0c,
+            FopenFlags::from_bits_retain(0x0c),
         );
     }
 
