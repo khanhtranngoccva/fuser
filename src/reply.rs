@@ -680,7 +680,7 @@ impl ReplyDirectoryPlus {
     /// value to request the next entries in further readdir calls
     pub fn add<T: AsRef<OsStr>>(
         &mut self,
-        ino: u64,
+        ino: INodeNo,
         offset: u64,
         name: T,
         ttl: &Duration,
@@ -689,7 +689,7 @@ impl ReplyDirectoryPlus {
     ) -> bool {
         let name = name.as_ref();
         self.buf.push(&DirEntryPlus::new(
-            INodeNo(ino),
+            ino,
             generation,
             DirEntOffset(offset),
             name,
