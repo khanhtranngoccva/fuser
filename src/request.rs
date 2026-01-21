@@ -244,6 +244,7 @@ impl<'a> RequestWithSender<'a> {
                     x.file_handle(),
                     x.offset()?,
                     x.size(),
+                    x.read_flags(),
                     x.flags(),
                     x.lock_owner(),
                     self.reply(),
