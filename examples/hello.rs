@@ -87,7 +87,8 @@ impl Filesystem for HelloFS {
         _fh: FileHandle,
         offset: u64,
         _size: u32,
-        _flags: ReadFlags,
+        _read_flags: ReadFlags,
+        _flags: u32,
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {

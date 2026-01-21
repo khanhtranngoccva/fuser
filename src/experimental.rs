@@ -171,7 +171,8 @@ impl<T: AsyncFilesystem> Filesystem for TokioAdapter<T> {
         fh: FileHandle,
         offset: u64,
         size: u32,
-        flags: ReadFlags,
+        read_flags: ReadFlags,
+        flags: u32,
         lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
@@ -182,6 +183,7 @@ impl<T: AsyncFilesystem> Filesystem for TokioAdapter<T> {
             fh,
             offset,
             size,
+            read_flags,
             flags,
             lock_owner,
             &mut buf,
@@ -236,7 +238,8 @@ pub trait AsyncFilesystem {
         file_handle: FileHandle,
         offset: u64,
         size: u32,
-        flags: ReadFlags,
+        read_flags: ReadFlags,
+        flags: u32,
         lock: Option<LockOwner>,
         out_data: &mut Vec<u8>,
     ) -> Result<()>;
