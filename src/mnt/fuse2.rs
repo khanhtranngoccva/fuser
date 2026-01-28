@@ -23,10 +23,8 @@ fn ensure_last_os_error() -> io::Error {
 #[derive(Debug)]
 pub(crate) struct MountImpl {
     mountpoint: CString,
-    blocking_umount: bool,
-    unmount_flags: Option<Vec<UnmountOption>>,
-    unmounted: bool,
 }
+
 impl MountImpl {
     pub(crate) fn new(
         mountpoint: &Path,

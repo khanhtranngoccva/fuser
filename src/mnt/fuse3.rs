@@ -40,9 +40,6 @@ fn cvt(res: i32) -> io::Result<()> {
 pub(crate) struct MountImpl {
     fuse_session: *mut c_void,
     mountpoint: CString,
-    blocking_umount: bool,
-    unmount_flags: Option<Vec<UnmountOption>>,
-    unmounted: bool,
 }
 impl MountImpl {
     pub(crate) fn new(
@@ -67,9 +64,6 @@ impl MountImpl {
             let mount = MountImpl {
                 fuse_session,
                 mountpoint: mnt.clone(),
-                blocking_umount: false,
-                unmount_flags: None,
-                unmounted: false,
             };
             let result = unsafe { fuse_session_mount(mount.fuse_session, mnt.as_ptr()) };
             if result != 0 {
