@@ -1,5 +1,4 @@
 use std::ffi::OsStr;
-use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
@@ -12,8 +11,6 @@ use fuser::FileType;
 use fuser::Filesystem;
 use fuser::INodeNo;
 use fuser::LockOwner;
-use fuser::MountOption;
-use fuser::OpenFlags;
 use fuser::ReadFlags;
 use fuser::ReplyAttr;
 use fuser::ReplyData;
@@ -76,7 +73,7 @@ const HELLO_TXT_ATTR: FileAttr = FileAttr {
     blksize: 512,
 };
 
-struct HelloFS;
+pub struct HelloFS;
 
 impl Filesystem for HelloFS {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
@@ -102,8 +99,7 @@ impl Filesystem for HelloFS {
         _fh: FileHandle,
         offset: u64,
         _size: u32,
-        _read_flags: ReadFlags,
-        _flags: OpenFlags,
+        _flags: ReadFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
@@ -140,37 +136,5 @@ impl Filesystem for HelloFS {
             }
         }
         reply.ok();
-    }
-}
-
-fn main() {
-    let args = Args::parse();
-    env_logger::init();
-
-    let mut options = vec![MountOption::RO, MountOption::FSName("hello".to_string())];
-    if args.auto_unmount {
-        options.push(MountOption::AutoUnmount);
-    }
-    if args.allow_root {
-        options.push(MountOption::AllowRoot);
-    }
-    if options.contains(&MountOption::AutoUnmount) && !options.contains(&MountOption::AllowRoot) {
-        options.push(MountOption::AllowOther);
-    }
-    let mut session = fuser::spawn_mount2(HelloFS, &args.mount_point, &options).unwrap();
-    std::io::stdin().read_line(&mut String::new()).unwrap();
-    loop {
-        let result = session.umount_and_join(&[]);
-        if let Err((session_inner, error)) = result {
-            if let Some(session_inner) = session_inner {
-                session = session_inner;
-                log::error!("retryable unmount error: {error}");
-            } else {
-                Result::<(), io::Error>::Err(error).expect("should unmount");
-                break;
-            }
-        } else {
-            break;
-        }
     }
 }
