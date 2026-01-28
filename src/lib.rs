@@ -31,30 +31,30 @@ use serde::Deserialize;
 use serde::Serialize;
 
 pub use crate::access_flags::AccessFlags;
+pub use crate::bsd_file_flags::BsdFileFlags;
+use crate::forget_one::ForgetOne;
 pub use crate::ll::Errno;
 pub use crate::ll::Generation;
 pub use crate::ll::RequestId;
 pub use crate::ll::TimeOrNow;
-pub use crate::ll::copy_file_range_flags::CopyFileRangeFlags;
-pub use crate::ll::fuse_abi::FopenFlags;
-pub use crate::ll::fuse_abi::InitFlags;
+pub use crate::ll::flags::copy_file_range_flags::CopyFileRangeFlags;
+pub use crate::ll::flags::fopen_flags::FopenFlags;
+pub use crate::ll::flags::init_flags::InitFlags;
+pub use crate::ll::flags::ioctl_flags::IoctlFlags;
+pub use crate::ll::flags::poll_flags::PollFlags;
+pub use crate::ll::flags::read_flags::ReadFlags;
+pub use crate::ll::flags::write_flags::WriteFlags;
 pub use crate::ll::fuse_abi::consts;
-use crate::ll::fuse_abi::consts::*;
-pub use crate::ll::fuse_abi::fuse_forget_one;
-pub use crate::ll::ioctl_flags::IoctlFlags;
-pub use crate::ll::poll_flags::PollFlags;
-pub use crate::ll::read_flags::ReadFlags;
 pub use crate::ll::request::FileHandle;
 pub use crate::ll::request::INodeNo;
 pub use crate::ll::request::LockOwner;
 pub use crate::ll::request::Version;
-pub use crate::ll::write_flags::WriteFlags;
 pub use crate::mnt::mount_options::MountOption;
 use crate::mnt::mount_options::check_option_conflicts;
 use crate::mnt::mount_options::parse_options_from_args;
-pub use crate::mnt::unmount_options::UnmountOption;
 pub use crate::notify::Notifier;
 pub use crate::notify::PollHandle;
+pub use crate::notify::PollNotifier;
 pub use crate::open_flags::OpenAccMode;
 pub use crate::open_flags::OpenFlags;
 pub use crate::passthrough::BackingId;
@@ -84,11 +84,13 @@ pub use crate::session::SessionACL;
 pub use crate::session::SessionUnmounter;
 
 mod access_flags;
+mod bsd_file_flags;
 mod channel;
 mod dev_fuse;
 /// Experimental APIs
 #[cfg(feature = "experimental")]
 pub mod experimental;
+mod forget_one;
 mod ll;
 mod mnt;
 mod notify;
@@ -250,7 +252,6 @@ impl KernelConfig {
     /// On success, returns the previous value.  
     /// # Errors
     /// If argument is too large, returns the nearest value which will succeed.
-    #[cfg(feature = "abi-7-40")]
     pub fn set_max_stack_depth(&mut self, value: u32) -> Result<u32, u32> {
         // https://lore.kernel.org/linux-fsdevel/CAOYeF9V_n93OEF_uf0Gwtd=+da0ReX8N2aaT6RfEJ9DPvs8O2w@mail.gmail.com/
         const FILESYSTEM_MAX_STACK_DEPTH: u32 = 2;
@@ -271,7 +272,6 @@ impl KernelConfig {
     /// On success returns the previous value.  
     /// # Errors
     /// If the argument does not match any valid granularity, returns the nearest value which will succeed.
-    #[cfg(feature = "abi-7-23")]
     pub fn set_time_granularity(&mut self, value: Duration) -> Result<Duration, Duration> {
         if value.as_nanos() == 0 {
             return Err(Duration::new(0, 1));
@@ -398,11 +398,11 @@ impl KernelConfig {
 /// implementations are provided here to get a mountable filesystem that does
 /// nothing.
 #[allow(clippy::too_many_arguments)]
-pub trait Filesystem {
+pub trait Filesystem: Send + Sync + 'static {
     /// Initialize filesystem.
     /// Called before any other filesystem method.
     /// The kernel module connection can be configured using the `KernelConfig` object
-    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> Result<(), Errno> {
+    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> io::Result<()> {
         Ok(())
     }
 
@@ -425,11 +425,11 @@ pub trait Filesystem {
     /// inodes will receive a forget message.
     fn forget(&self, _req: &Request, _ino: INodeNo, _nlookup: u64) {}
 
-    /// Like forget, but take multiple forget requests at once for performance. The default
-    /// implementation will fallback to forget.
-    fn batch_forget(&self, req: &Request, nodes: &[fuse_forget_one]) {
+    /// Like [`forget`](Self::forget), but take multiple forget requests at once for performance. The default
+    /// implementation will fallback to `forget`.
+    fn batch_forget(&self, req: &Request, nodes: &[ForgetOne]) {
         for node in nodes {
-            self.forget(req, INodeNo(node.nodeid), node.nlookup);
+            self.forget(req, node.nodeid(), node.nlookup());
         }
     }
 
@@ -455,7 +455,7 @@ pub trait Filesystem {
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        flags: Option<u32>,
+        flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
         warn!(
@@ -627,7 +627,7 @@ pub trait Filesystem {
         offset: i64,
         data: &[u8],
         write_flags: WriteFlags,
-        flags: i32,
+        flags: OpenFlags,
         lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
@@ -675,7 +675,7 @@ pub trait Filesystem {
         _req: &Request,
         _ino: INodeNo,
         _fh: FileHandle,
-        _flags: i32,
+        _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
@@ -752,7 +752,7 @@ pub trait Filesystem {
         _req: &Request,
         _ino: INodeNo,
         _fh: FileHandle,
-        _flags: i32,
+        _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
         reply.ok();
@@ -938,7 +938,7 @@ pub trait Filesystem {
         _req: &Request,
         ino: INodeNo,
         fh: FileHandle,
-        ph: PollHandle,
+        ph: PollNotifier,
         events: PollEvents,
         flags: PollFlags,
         reply: ReplyPoll,
@@ -1073,7 +1073,7 @@ pub fn mount2<FS: Filesystem, P: AsRef<Path>>(
     options: &[MountOption],
 ) -> io::Result<()> {
     check_option_conflicts(options)?;
-    Session::new(filesystem, mountpoint.as_ref(), options).and_then(|mut se| se.run())
+    Session::new(filesystem, mountpoint.as_ref(), options).and_then(|se| se.run())
 }
 
 /// Mount the given filesystem to the given mountpoint. This function spawns

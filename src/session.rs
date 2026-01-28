@@ -14,7 +14,6 @@ use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::thread::{self};
 
@@ -25,25 +24,26 @@ use libc::ENOENT;
 use log::debug;
 use log::error;
 use log::info;
-use log::warn;
 use nix::unistd::Uid;
 use nix::unistd::geteuid;
+use parking_lot::Mutex;
 
+use crate::Errno;
 use crate::Filesystem;
 use crate::KernelConfig;
 use crate::MountOption;
+use crate::ReplyEmpty;
 use crate::Request;
-use crate::UnmountOption;
 use crate::channel::Channel;
 use crate::channel::ChannelSender;
 use crate::dev_fuse::DevFuse;
 use crate::ll;
-use crate::ll::Request as _;
+use crate::ll::Operation;
 use crate::ll::Response;
 use crate::ll::Version;
+use crate::ll::flags::init_flags::InitFlags;
 use crate::ll::fuse_abi as abi;
 use crate::mnt::Mount;
-use crate::mnt::unmount_options;
 use crate::notify::Notifier;
 use crate::reply::Reply;
 use crate::reply::ReplyRaw;
@@ -74,8 +74,8 @@ pub enum SessionACL {
 /// The session data structure
 #[derive(Debug)]
 pub struct Session<FS: Filesystem> {
-    /// Filesystem operation implementations
-    pub(crate) filesystem: FS,
+    /// Filesystem operation implementations. None after `destroy` called.
+    pub(crate) filesystem: Option<FS>,
     /// Communication channel to the kernel driver
     pub(crate) ch: Channel,
     /// Handle to the mount.  Dropping this unmounts.
@@ -88,8 +88,6 @@ pub struct Session<FS: Filesystem> {
     /// FUSE protocol version, as reported by the kernel.
     /// The field is set to `Some` when the init message is received.
     pub(crate) proto_version: Option<Version>,
-    /// True if the filesystem was destroyed (destroy operation done)
-    pub(crate) destroyed: bool,
 }
 
 impl<FS: Filesystem> AsFd for Session<FS> {
@@ -109,22 +107,18 @@ impl<FS: Filesystem> Session<FS> {
     ) -> io::Result<Session<FS>> {
         let mountpoint = mountpoint.as_ref();
         info!("Mounting {}", mountpoint.display());
-        // If AutoUnmount is requested, but not AllowRoot or AllowOther we enforce the ACL
-        // ourself and implicitly set AllowOther because fusermount needs allow_root or allow_other
-        // to handle the auto_unmount option
-        let (file, mount) = if options.contains(&MountOption::AutoUnmount)
+        // If AutoUnmount is requested, but not AllowRoot or AllowOther, return an error
+        // because fusermount needs allow_root or allow_other to handle the auto_unmount option
+        if options.contains(&MountOption::AutoUnmount)
             && !(options.contains(&MountOption::AllowRoot)
                 || options.contains(&MountOption::AllowOther))
         {
-            warn!(
-                "Given auto_unmount without allow_root or allow_other; adding allow_other, with userspace permission handling"
-            );
-            let mut modified_options = options.to_vec();
-            modified_options.push(MountOption::AllowOther);
-            Mount::new(mountpoint, &modified_options)?
-        } else {
-            Mount::new(mountpoint, options)?
-        };
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "auto_unmount requires allow_root or allow_other",
+            ));
+        }
+        let (file, mount) = Mount::new(mountpoint, options)?;
 
         let ch = Channel::new(file);
         let allowed = if options.contains(&MountOption::AllowRoot) {
@@ -136,13 +130,12 @@ impl<FS: Filesystem> Session<FS> {
         };
 
         Ok(Session {
-            filesystem,
+            filesystem: Some(filesystem),
             ch,
             mount: Arc::new(Mutex::new(Some((mountpoint.to_owned(), mount)))),
             allowed,
             session_owner: geteuid(),
             proto_version: None,
-            destroyed: false,
         })
     }
 
@@ -151,14 +144,27 @@ impl<FS: Filesystem> Session<FS> {
     pub fn from_fd(filesystem: FS, fd: OwnedFd, acl: SessionACL) -> Self {
         let ch = Channel::new(Arc::new(DevFuse(File::from(fd))));
         Session {
-            filesystem,
+            filesystem: Some(filesystem),
             ch,
             mount: Arc::new(Mutex::new(None)),
             allowed: acl,
             session_owner: geteuid(),
             proto_version: None,
-            destroyed: false,
         }
+    }
+
+    /// Run the session loop in a background thread. If the returned handle is dropped,
+    /// the filesystem is unmounted and the given session ends.
+    pub fn spawn(self) -> io::Result<BackgroundSession> {
+        let sender = self.ch.sender();
+        // Take the fuse_session, so that we can unmount it
+        let mount = std::mem::take(&mut *self.mount.lock()).map(|(_, mount)| mount);
+        let guard = thread::spawn(move || self.run());
+        Ok(BackgroundSession {
+            guard,
+            sender,
+            mount,
+        })
     }
 
     /// Run the session loop that receives kernel requests and dispatches them to method
@@ -167,7 +173,7 @@ impl<FS: Filesystem> Session<FS> {
     /// may run concurrent by spawning threads.
     /// # Errors
     /// Returns any final error when the session comes to an end.
-    pub fn run(&mut self) -> io::Result<()> {
+    pub(crate) fn run(mut self) -> io::Result<()> {
         // Buffer for receiving requests from the kernel. Only one is allocated and
         // it is reused immediately after dispatching to conserve memory and allocations.
         let mut buffer = vec![0; BUFFER_SIZE];
@@ -175,15 +181,44 @@ impl<FS: Filesystem> Session<FS> {
 
         self.handshake(buf)?;
 
+        let ret = self.event_loop(buf);
+
+        if let Some(mut filesystem) = self.filesystem.take() {
+            filesystem.destroy();
+        }
+
+        match ret {
+            Err(e) => Err(e),
+            Ok(None) => Ok(()),
+            Ok(Some(destroy_reply)) => {
+                destroy_reply.ok();
+                Ok(())
+            }
+        }
+    }
+
+    /// Return `Some` if reply to `FUSE_DESTROY` needs to be sent.
+    fn event_loop(&self, buf: &mut [u8]) -> io::Result<Option<ReplyEmpty>> {
         loop {
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
             match self.ch.receive(buf) {
                 Ok(size) => match RequestWithSender::new(self.ch.sender(), &buf[..size]) {
                     // Dispatch request
-                    Some(req) => req.dispatch(self),
+                    Some(req) => {
+                        if let Ok(Operation::Destroy(_)) = req.request.operation() {
+                            return Ok(Some(req.reply()));
+                        } else {
+                            req.dispatch(self)
+                        }
+                    }
                     // Quit loop on illegal request
-                    None => break,
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Invalid request",
+                        ));
+                    }
                 },
                 Err(err) => match err.raw_os_error() {
                     Some(
@@ -191,33 +226,12 @@ impl<FS: Filesystem> Session<FS> {
                         | EINTR // Interrupted system call, retry
                         | EAGAIN // Explicitly instructed to try again
                     ) => continue,
-                    Some(ENODEV) => break,
+                    Some(ENODEV) => return Ok(None),
                     // Unhandled error
                     _ => return Err(err),
                 },
             }
         }
-        Ok(())
-    }
-
-    /// Set the unmount options on drop
-    pub fn set_unmount_options(&mut self, options: Option<&[UnmountOption]>) -> io::Result<()> {
-        if let Some(options) = options {
-            unmount_options::check_option_conflicts(options)?;
-        }
-        let mut guard = self.mount.lock().unwrap();
-        guard.as_mut().map(|(_, mount)| {
-            mount.set_unmount_flags(options);
-        });
-        Ok(())
-    }
-
-    /// Enable or disable blocking if the umount operation is busy
-    pub fn set_blocking_unmount(&mut self, blocking: bool) {
-        let mut guard = self.mount.lock().unwrap();
-        guard.as_mut().map(|(_, mount)| {
-            mount.set_blocking_unmount(blocking);
-        });
     }
 
     fn handshake(&mut self, buf: &mut [u8]) -> io::Result<()> {
@@ -305,14 +319,19 @@ impl<FS: Filesystem> Session<FS> {
             let mut config = KernelConfig::new(init.capabilities(), init.max_readahead(), v);
 
             // Call filesystem init method and give it a chance to return an error
-            if let Err(errno) = self
-                .filesystem
-                .init(Request::ref_cast(request.header()), &mut config)
-            {
+            let Some(filesystem) = &mut self.filesystem else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Bug: filesystem must be initialized during handshake",
+                ));
+            };
+            let res = filesystem.init(Request::ref_cast(request.header()), &mut config);
+            if let Err(error) = res {
+                let errno = Errno::from_i32(error.raw_os_error().unwrap_or(0));
                 let response = Response::new_error(errno);
                 <ReplyRaw as Reply>::new(request.unique(), ReplySender::Channel(self.ch.sender()))
                     .send_ll(&response);
-                return Err(io::Error::from_raw_os_error(errno.0.get()));
+                return Err(error);
             }
 
             // Remember the ABI version supported by kernel and mark the session initialized.
@@ -320,11 +339,11 @@ impl<FS: Filesystem> Session<FS> {
 
             // Log capability status for debugging
             for bit in 0..64 {
-                let bitflags = abi::InitFlags::from_bits_retain(1 << bit);
-                if bitflags == abi::InitFlags::FUSE_INIT_EXT {
+                let bitflags = InitFlags::from_bits_retain(1 << bit);
+                if bitflags == InitFlags::FUSE_INIT_EXT {
                     continue;
                 }
-                let bitflag_is_known = abi::InitFlags::all().contains(bitflags);
+                let bitflag_is_known = InitFlags::all().contains(bitflags);
                 let kernel_supports = init.capabilities().contains(bitflags);
                 let we_requested = config.requested.contains(bitflags);
                 // On macOS, there's a clash between linux and macOS constants,
@@ -365,13 +384,8 @@ impl<FS: Filesystem> Session<FS> {
 
     /// Unmount the filesystem
     pub fn unmount(&mut self) -> io::Result<()> {
-        let mut guard = self.mount.lock().unwrap();
-        let mount_info = guard.take();
-        if let Some((path, mount)) = mount_info {
-            if let Err((mount, e)) = mount.unmount() {
-                *guard = Some((path, mount));
-                return Err(e);
-            }
+        if let Some((_path, mount)) = std::mem::take(&mut *self.mount.lock()) {
+            mount.umount()?;
         }
         Ok(())
     }
@@ -398,37 +412,10 @@ pub struct SessionUnmounter {
 impl SessionUnmounter {
     /// Unmount the filesystem
     pub fn unmount(&mut self) -> io::Result<()> {
-        let mut guard = self.mount.lock().unwrap();
-        let mount_info = guard.take();
-        if let Some((path, mount)) = mount_info {
-            if let Err((mount, e)) = mount.unmount() {
-                // Returns the mount and error to the object and to retry unmounting at another time
-                *guard = Some((path, mount));
-                return Err(e);
-            }
-            info!("unmounted session at {}", path.display());
+        if let Some((_path, mount)) = std::mem::take(&mut *self.mount.lock()) {
+            mount.umount()?;
         }
         Ok(())
-    }
-
-    /// Set the unmount options
-    pub fn set_unmount_options(&mut self, options: Option<&[UnmountOption]>) -> io::Result<()> {
-        if let Some(options) = options {
-            unmount_options::check_option_conflicts(options)?;
-        }
-        let mut guard = self.mount.lock().unwrap();
-        guard.as_mut().map(|(_, mount)| {
-            mount.set_unmount_flags(options);
-        });
-        Ok(())
-    }
-
-    /// Enable or disable blocking if the umount operation is busy
-    pub fn set_blocking_unmount(&mut self, blocking: bool) {
-        let mut guard = self.mount.lock().unwrap();
-        guard.as_mut().map(|(_, mount)| {
-            mount.set_blocking_unmount(blocking);
-        });
     }
 }
 
@@ -441,21 +428,13 @@ fn aligned_sub_buf(buf: &mut [u8], alignment: usize) -> &mut [u8] {
     }
 }
 
-impl<FS: 'static + Filesystem + Send> Session<FS> {
-    /// Run the session loop in a background thread
-    pub fn spawn(self) -> io::Result<BackgroundSession> {
-        BackgroundSession::new(self)
-    }
-}
-
 impl<FS: Filesystem> Drop for Session<FS> {
     fn drop(&mut self) {
-        if !self.destroyed {
-            self.filesystem.destroy();
-            self.destroyed = true;
+        if let Some(mut filesystem) = self.filesystem.take() {
+            filesystem.destroy();
         }
 
-        if let Some((mountpoint, _mount)) = std::mem::take(&mut *self.mount.lock().unwrap()) {
+        if let Some((mountpoint, _mount)) = std::mem::take(&mut *self.mount.lock()) {
             info!("unmounting session at {}", mountpoint.display());
         }
     }
@@ -469,76 +448,32 @@ pub struct BackgroundSession {
     /// Object for creating Notifiers for client use
     sender: ChannelSender,
     /// Ensures the filesystem is unmounted when the session ends
-    _mount: Option<Mount>,
+    mount: Option<Mount>,
 }
 
 impl BackgroundSession {
-    /// Create a new background session for the given session by running its
-    /// session loop in a background thread. If the returned handle is dropped,
-    /// the filesystem is unmounted and the given session ends.
-    pub fn new<FS: Filesystem + Send + 'static>(se: Session<FS>) -> io::Result<BackgroundSession> {
-        let sender = se.ch.sender();
-        // Take the fuse_session, so that we can unmount it
-        let mount = std::mem::take(&mut *se.mount.lock().unwrap()).map(|(_, mount)| mount);
-        let guard = thread::spawn(move || {
-            let mut se = se;
-            se.run()
-        });
-        Ok(BackgroundSession {
-            guard,
-            sender,
-            _mount: mount,
-        })
-    }
-
     /// Unmount the filesystem and join the background thread.
-    ///
-    /// # Returns
-    /// - `Ok(())` if the background thread joined successfully
-    /// - `Err(Some<Self>, io::Error)` if the unmount operation failed. The session is salvaged and returned to the caller
-    /// - `Err(None, io::Error)` if the background thread returns an error for any reason.
-    ///
-    /// # Panics
-    /// Panics if the background thread can't be recovered (e.g., because it panicked).
-    pub fn unmount_and_join(mut self) -> Result<(), (Option<Self>, io::Error)> {
-        if let Some(mount) = self._mount.take() {
-            if let Err((mount, e)) = mount.unmount() {
-                // Return the mount and error to the object and to retry unmounting at another time
-                self._mount = Some(mount);
-                return Err((Some(self), e));
-            }
+    pub fn umount_and_join(self) -> io::Result<()> {
+        let Self {
+            guard,
+            sender: _,
+            mount,
+        } = self;
+        if let Some(mount) = mount {
+            mount.umount()?;
         }
-        self.guard
+        guard
             .join()
             .map_err(|_panic: Box<dyn std::any::Any + Send>| {
-                (
-                    None,
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        "filesystem background thread panicked",
-                    ),
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    "filesystem background thread panicked",
                 )
             })?
-            .map_err(|e| (None, e))?;
-        Ok(())
     }
 
     /// Returns an object that can be used to send notifications to the kernel
     pub fn notifier(&self) -> Notifier {
         Notifier::new(self.sender.clone())
-    }
-
-    /// Set the unmount options
-    pub fn set_unmount_options(&mut self, options: Option<&[UnmountOption]>) -> io::Result<()> {
-        if let Some(options) = options {
-            unmount_options::check_option_conflicts(options)?;
-        }
-        self._mount.as_mut().unwrap().set_unmount_flags(options);
-        Ok(())
-    }
-
-    /// Enable or disable blocking if the umount operation is busy
-    pub fn set_blocking_unmount(&mut self, blocking: bool) {
-        self._mount.as_mut().unwrap().set_blocking_unmount(blocking);
     }
 }

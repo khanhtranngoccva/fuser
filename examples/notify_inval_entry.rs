@@ -9,7 +9,6 @@
 
 use std::ffi::OsStr;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::SeqCst;
 use std::thread;
@@ -29,18 +28,19 @@ use fuser::ReplyAttr;
 use fuser::ReplyDirectory;
 use fuser::ReplyEntry;
 use fuser::Request;
+use parking_lot::Mutex;
 
-struct ClockFS<'a> {
+struct ClockFS {
     file_name: Arc<Mutex<String>>,
-    lookup_cnt: &'a AtomicU64,
+    lookup_cnt: &'static AtomicU64,
     timeout: Duration,
 }
 
-impl ClockFS<'_> {
+impl ClockFS {
     const FILE_INO: u64 = 2;
 
     fn get_filename(&self) -> String {
-        let n = self.file_name.lock().unwrap();
+        let n = self.file_name.lock();
         n.clone()
     }
 
@@ -71,7 +71,7 @@ impl ClockFS<'_> {
     }
 }
 
-impl Filesystem for ClockFS<'_> {
+impl Filesystem for ClockFS {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         if parent != INodeNo::ROOT || name != AsRef::<OsStr>::as_ref(&self.get_filename()) {
             reply.error(Errno::ENOENT);
@@ -175,7 +175,7 @@ fn main() {
     let _bg = session.spawn().unwrap();
 
     loop {
-        let mut fname = fname.lock().unwrap();
+        let mut fname = fname.lock();
         let oldname = std::mem::replace(&mut *fname, now_filename());
         drop(fname);
         if !opts.no_notify && lookup_cnt.load(SeqCst) != 0 {
