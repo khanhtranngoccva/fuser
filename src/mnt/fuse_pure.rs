@@ -24,6 +24,7 @@ use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -54,9 +55,35 @@ const MOUNT_FUSEFS_BIN: &str = "mount_fusefs";
 #[derive(Debug)]
 pub(crate) struct MountImpl {
     mountpoint: CString,
-    auto_unmount_socket: Option<UnixStream>,
+    _auto_unmount: Option<AutoUnmount>,
     fuse_device: Arc<DevFuse>,
 }
+
+#[derive(Debug)]
+struct AutoUnmount {
+    process: Child,
+    _socket: Option<UnixStream>,
+}
+
+impl AutoUnmount {
+    fn new(process: Child, socket: UnixStream) -> Self {
+        Self {
+            process,
+            _socket: Some(socket),
+        }
+    }
+}
+
+impl Drop for AutoUnmount {
+    fn drop(&mut self) {
+        if let Some(socket) = mem::take(&mut self._socket) {
+            drop(socket);
+        }
+        // Do not allow the process to persist as a zombie
+        let _ = self.process.wait();
+    }
+}
+
 impl MountImpl {
     pub(crate) fn new(
         mountpoint: &Path,
@@ -64,13 +91,13 @@ impl MountImpl {
         acl: SessionACL,
     ) -> io::Result<(Arc<DevFuse>, MountImpl)> {
         let mountpoint = mountpoint.canonicalize()?;
-        let (file, sock) = fuse_mount_pure(mountpoint.as_os_str(), options, acl)?;
+        let (file, auto_unmount) = fuse_mount_pure(mountpoint.as_os_str(), options, acl)?;
         let file = Arc::new(file);
         Ok((
             file.clone(),
             MountImpl {
                 mountpoint: CString::new(mountpoint.as_os_str().as_bytes())?,
-                auto_unmount_socket: sock,
+                _auto_unmount: auto_unmount,
                 fuse_device: file,
             },
         ))
@@ -83,12 +110,6 @@ impl MountImpl {
                     // If the filesystem has already been unmounted, avoid unmounting it again.
                     // Unmounting it a second time could cause a race with a newly mounted filesystem
                     // living at the same mountpoint
-                    return Ok(());
-                }
-                if let Some(sock) = mem::take(&mut self.auto_unmount_socket) {
-                    // fusermount in auto-unmount mode, no more work to do.
-                    // On Linux 2.4.11+, the detached mode is used.
-                    drop(sock);
                     return Ok(());
                 }
                 if let Err(err) = crate::mnt::libc_umount(&self.mountpoint) {
@@ -112,7 +133,7 @@ fn fuse_mount_pure(
     mountpoint: &OsStr,
     options: &[MountOption],
     acl: SessionACL,
-) -> Result<(DevFuse, Option<UnixStream>), io::Error> {
+) -> Result<(DevFuse, Option<AutoUnmount>), io::Error> {
     if options.contains(&MountOption::AutoUnmount) {
         // Auto unmount is only supported via fusermount
         return fuse_mount_fusermount(mountpoint, options, acl);
@@ -224,7 +245,7 @@ fn receive_fusermount_message(socket: &UnixStream) -> Result<DevFuse, Error> {
             socket.as_raw_fd(),
             &mut iov,
             Some(&mut cmsg_buffer),
-            MsgFlags::empty(),
+            MsgFlags::MSG_CMSG_CLOEXEC,
         ) {
             Ok(msg) => break msg,
             Err(nix::errno::Errno::EINTR) => continue,
@@ -239,18 +260,24 @@ fn receive_fusermount_message(socket: &UnixStream) -> Result<DevFuse, Error> {
         ));
     }
 
-    for cmsg in msg
+    if let Some(cmsg) = msg
         .cmsgs()
         .map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?
+        .next()
     {
+        let mut owned_fds = Vec::new();
         match cmsg {
             ControlMessageOwned::ScmRights(fds) => {
-                if let Some(&fd) = fds.first() {
+                for fd in fds {
                     if fd < 0 {
                         return Err(ErrorKind::InvalidData.into());
                     }
-                    return Ok(DevFuse(unsafe { File::from_raw_fd(fd) }));
+                    owned_fds.push(unsafe { File::from_raw_fd(fd) });
                 }
+                if owned_fds.is_empty() {
+                    return Err(ErrorKind::InvalidData.into());
+                }
+                return Ok(DevFuse(owned_fds.remove(0)));
             }
             other => {
                 return Err(Error::new(
@@ -289,7 +316,7 @@ fn fuse_mount_fusermount(
     mountpoint: &OsStr,
     options: &[MountOption],
     acl: SessionACL,
-) -> Result<(DevFuse, Option<UnixStream>), Error> {
+) -> Result<(DevFuse, Option<AutoUnmount>), Error> {
     let fusermount_bin = detect_fusermount_bin();
 
     if fusermount_bin.ends_with(MOUNT_FUSEFS_BIN) {
@@ -315,7 +342,7 @@ fn fuse_mount_fusermount(
         clear_cloexec_in_pre_exec(&mut builder, child_socket.as_fd());
     }
 
-    let fusermount_child = builder.spawn()?;
+    let mut fusermount_child = builder.spawn()?;
 
     drop(child_socket); // close socket in parent
 
@@ -333,17 +360,18 @@ fn fuse_mount_fusermount(
             };
         }
     };
-    let mut receive_socket = Some(receive_socket);
+
+    let mut auto_unmount = None;
 
     if !options.contains(&MountOption::AutoUnmount) {
         // Only close the socket, if auto unmount is not set.
         // fusermount will keep running until the socket is closed, if auto unmount is set
-        drop(mem::take(&mut receive_socket));
+        drop(receive_socket);
         let output = fusermount_child.wait_with_output()?;
         debug!("fusermount: {}", String::from_utf8_lossy(&output.stdout));
         debug!("fusermount: {}", String::from_utf8_lossy(&output.stderr));
     } else {
-        if let Some(mut stdout) = fusermount_child.stdout {
+        if let Some(stdout) = &mut fusermount_child.stdout {
             // TODO: do not ignore error.
             if let Ok(flags) = fcntl(&stdout, FcntlArg::F_GETFL) {
                 let new_flags = OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK;
@@ -354,7 +382,7 @@ fn fuse_mount_fusermount(
                 debug!("fusermount: {}", String::from_utf8_lossy(&buf[..len]));
             }
         }
-        if let Some(mut stderr) = fusermount_child.stderr {
+        if let Some(stderr) = &mut fusermount_child.stderr {
             // TODO: do not ignore error.
             if let Ok(flags) = fcntl(&stderr, FcntlArg::F_GETFL) {
                 let new_flags = OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK;
@@ -365,12 +393,12 @@ fn fuse_mount_fusermount(
                 debug!("fusermount: {}", String::from_utf8_lossy(&buf[..len]));
             }
         }
+        auto_unmount = Some(AutoUnmount::new(fusermount_child, receive_socket));
     }
 
     // TODO: do not ignore error.
     let _ = fcntl(&file, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC));
-
-    Ok((file, receive_socket))
+    Ok((file, auto_unmount))
 }
 
 fn fuse_mount_mount_fusefs(
@@ -378,7 +406,7 @@ fn fuse_mount_mount_fusefs(
     mountpoint: &OsStr,
     options: &[MountOption],
     acl: SessionACL,
-) -> Result<(DevFuse, Option<UnixStream>), Error> {
+) -> Result<(DevFuse, Option<AutoUnmount>), Error> {
     let fuse_device = DevFuse::open()?;
 
     let fuse_fd = fuse_device.as_raw_fd();
