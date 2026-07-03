@@ -203,6 +203,7 @@ impl<FS: Filesystem> Session<FS> {
     fn validate_execution(options: &Config) -> io::Result<()> {
         let n_threads = options.n_threads.unwrap_or(1);
 
+        #[cfg(not(feature = "allow-multi-thread"))]
         if !cfg!(target_os = "linux") && n_threads != 1 {
             // TODO: check whether it works on macOS/FreeBSD and enable if it works.
             return Err(io::Error::other(
@@ -280,6 +281,7 @@ impl<FS: Filesystem> Session<FS> {
             proto_version: _,
             config,
         } = self;
+
         let mut filesystem = Arc::new(filesystem);
         let n_threads = config.n_threads.unwrap_or(1);
         let n_threads_minus_one = n_threads
