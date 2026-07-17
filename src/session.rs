@@ -23,6 +23,7 @@ use log::warn;
 use nix::unistd::Uid;
 use nix::unistd::geteuid;
 use parking_lot::Mutex;
+use threadpool::ThreadPool;
 
 use crate::Errno;
 use crate::Filesystem;
@@ -309,6 +310,7 @@ impl<FS: Filesystem> Session<FS> {
         channels.push(ch);
 
         let mut threads = Vec::with_capacity(n_threads);
+        let interrupt_pool = ThreadPool::new((n_threads / 3).max(1usize));
 
         for (i, ch) in channels.into_iter().enumerate() {
             let thread_name = (config.thread_name_fn)(i);
@@ -319,6 +321,7 @@ impl<FS: Filesystem> Session<FS> {
                 ch,
                 allowed,
                 session_owner,
+                interrupt_pool: interrupt_pool.clone(),
             };
             threads.push(
                 thread::Builder::new()
@@ -342,6 +345,7 @@ impl<FS: Filesystem> Session<FS> {
             }
         }
 
+        interrupt_pool.join();
         let Some(filesystem) = Arc::get_mut(&mut filesystem) else {
             return Err(io::Error::other(
                 "BUG: must have one refcount for filesystem",
@@ -539,6 +543,7 @@ pub(crate) struct SessionEventLoop<FS: Filesystem> {
     pub(crate) filesystem: Arc<FilesystemHolder<FS>>,
     pub(crate) allowed: SessionACL,
     pub(crate) session_owner: Uid,
+    pub(crate) interrupt_pool: ThreadPool,
 }
 
 impl<FS: Filesystem> SessionEventLoop<FS> {
