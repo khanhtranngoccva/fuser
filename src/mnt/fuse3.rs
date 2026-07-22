@@ -63,18 +63,20 @@ impl MountImpl {
             };
             let result = unsafe { fuse_session_mount(mount.fuse_session, mnt.as_ptr()) };
             if result != 0 {
+                let res = Err(ensure_last_os_error());
                 unsafe {
                     fuse_session_destroy(fuse_session);
                 }
-                return Err(ensure_last_os_error());
+                return res;
             }
             let fd = unsafe { fuse_session_fd(mount.fuse_session) };
             if fd < 0 {
+                let res = Err(ensure_last_os_error());
                 unsafe {
                     fuse_session_unmount(fuse_session);
                     fuse_session_destroy(fuse_session);
                 }
-                return Err(io::Error::last_os_error());
+                return res;
             }
             let fd = unsafe { BorrowedFd::borrow_raw(fd) };
             // We dup the fd here as the existing fd is owned by the fuse_session, and we

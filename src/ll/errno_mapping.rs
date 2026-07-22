@@ -394,10 +394,10 @@ pub(crate) fn get_errno_message(
     errno: impl Into<Errno>,
     locale_id: &LocaleId,
 ) -> Result<Option<OsString>, std::io::Error> {
-    let mapping = get_errno_mapping(&ERRNO_MAPPING, locale_id)?;
-    Ok(mapping
-        .get_by_left(&errno.into())
-        .map(|os_str| os_str.to_owned()))
+    let locale = Locale::new(libc::LC_MESSAGES_MASK, locale_id.clone())?;
+    locale
+        .with_activate(|| strerror_r_dynamic(errno.into().code()))
+        .map(Some)
 }
 
 /// Attempts to convert a message to an errno object.
@@ -416,20 +416,24 @@ mod tests {
 
     #[test]
     fn test_get_errno_message() {
-        let errno = Errno::EPERM;
+        let errno = Errno::from_i32(libc::EADDRINUSE);
         let message = get_errno_message(errno, &"C".try_into().expect("locale should be valid"))
             .expect("locale should be valid")
             .expect("message should be present");
-        assert_eq!(message, "Operation not permitted");
+        #[cfg(target_env = "musl")]
+        assert_eq!(message, "Address in use");
+        #[cfg(target_env = "gnu")]
+        assert_eq!(message, "Address already in use");
     }
 
     #[test]
     fn test_get_errno_by_message() {
-        let message = OsString::from("Operation not permitted");
+        // Should detect errors from GNU, MUSL, and so on so forth.
+        let message = OsString::from("Address in use");
         let errno = get_errno_by_message(message, &"C".try_into().expect("locale should be valid"))
             .expect("locale should be valid")
             .expect("errno should be present");
-        assert_eq!(errno, Errno::EPERM);
+        assert_eq!(errno, Errno::from_i32(libc::EADDRINUSE));
     }
 
     #[ignore = "German locale needs to be installed"]

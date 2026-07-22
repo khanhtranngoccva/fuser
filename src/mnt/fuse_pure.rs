@@ -166,6 +166,7 @@ fn fuse_unmount_pure(mountpoint: &CStr) -> io::Result<()> {
         .arg("-z")
         .arg("--")
         .env("LC_MESSAGES", "C")
+        .env("LC_ALL", "C")
         .arg(OsStr::new(&mountpoint.to_string_lossy().into_owned()));
     let output = builder.output()?;
     debug!(
@@ -200,7 +201,7 @@ fn fuse_unmount_pure(mountpoint: &CStr) -> io::Result<()> {
 }
 
 fn parse_fusermount_unmount_stderr(output: &OsStr) -> Option<OsString> {
-    let parse_regex = Regex::new(r"([^:]+): failed to unmount ([^:]+): (.+)")
+    let parse_regex = Regex::new(r"([^:]+): failed to unmount (.+): (.+)")
         .expect("built-in regex should be valid");
     parse_regex.captures(output.as_bytes()).map(|captures| {
         let error = captures.get(3).map(|m| m.as_bytes()).unwrap_or_default();
@@ -567,4 +568,19 @@ fn fuse_mount_sys(
     _acl: SessionACL,
 ) -> Result<Option<DevFuse>, Error> {
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_fusermount_message() {
+        // This test should deal with error messages containing a path
+        let input = OsStr::new("fusermount3: failed to unmount /tmp/a:b:c: Device or resource busy");
+        assert_eq!(
+            parse_fusermount_unmount_stderr(input),
+            Some(OsString::from("Device or resource busy"))
+        );
+    }
 }

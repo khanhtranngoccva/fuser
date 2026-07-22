@@ -26,6 +26,7 @@ use fuser::ReplyIoctl;
 use fuser::Request;
 use log::debug;
 use parking_lot::Mutex;
+use nix::sys::ioctl::ioctl_num_type;
 
 use crate::common::args::CommonArgs;
 
@@ -38,8 +39,8 @@ struct Args {
 
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
-const FIOC_GET_SIZE: u64 = nix::request_code_read!('E', 0, size_of::<usize>());
-const FIOC_SET_SIZE: u64 = nix::request_code_write!('E', 1, size_of::<usize>());
+const FIOC_GET_SIZE: ioctl_num_type = nix::request_code_read!('E', 0, size_of::<usize>());
+const FIOC_SET_SIZE: ioctl_num_type = nix::request_code_write!('E', 1, size_of::<usize>());
 
 struct FiocFS {
     content: Mutex<Vec<u8>>,
@@ -176,7 +177,7 @@ impl Filesystem for FiocFS {
             return;
         }
 
-        match cmd.into() {
+        match cmd as ioctl_num_type {
             FIOC_GET_SIZE => {
                 let content = self.content.lock();
                 let size_bytes = content.len().to_ne_bytes();
