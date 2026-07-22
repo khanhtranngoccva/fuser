@@ -1,4 +1,6 @@
 #![allow(unused_imports)]
+use std::{fs::File, time::Duration};
+
 use fuser::{Config, MountOption, SessionACL};
 
 mod fixtures;
@@ -26,4 +28,26 @@ fn test_session_auto_unmount() {
     config.acl = SessionACL::All;
     let session = fuser::spawn_mount(filesystem, mountpoint, &config).unwrap();
     session.umount_and_join().expect("Failed to unmount");
+}
+
+#[test_log::test]
+fn test_session_busy_unmount() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let mountpoint = tempfile::TempDir::new().unwrap();
+    let filesystem =
+        fixtures::simple::SimpleFS::new(data_dir.path().to_str().unwrap().to_string(), false, true);
+    let mut config = Config::default();
+    config
+        .mount_options
+        .extend(vec![MountOption::FSName("fuser".to_string())]);
+    config.n_threads = Some(2);
+    config.acl = SessionACL::All;
+    let session = fuser::spawn_mount(filesystem, &mountpoint, &config).unwrap();
+    let file = File::create(mountpoint.path().join("test")).expect("should create file");
+    let detached = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs_f64(0.5));
+        drop(file);
+    });
+    session.umount_and_join().expect("Failed to unmount");
+    detached.join().expect("should join detached thread");
 }
